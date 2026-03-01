@@ -36,7 +36,7 @@ class Tracker:
         
         for det in detections:
             bbox = det['bbox']
-            cls_name = det['name']
+            cls_name = det.get('class', det.get('name', 'unknown'))
             is_weapon = det.get('is_weapon', False)
             
             best_id = None
