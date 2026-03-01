@@ -15,6 +15,14 @@ class Detector:
                  weapon_model_path: str = 'models/weapon_yolov8.pt',
                  conf: float            = 0.35,
                  weapon_conf: float     = 0.40):
+        """
+        model_path        – General COCO model. Use yolov8s.pt or larger for
+                            better accuracy (far fewer phone↔gun confusions).
+        weapon_model_path – Optional dedicated weapon model (e.g. trained on
+                            gun/knife datasets). Skipped if file not found.
+        conf              – General model confidence threshold.
+        weapon_conf       – Weapon model confidence threshold (higher = fewer FP).
+        """
         self.conf        = conf
         self.weapon_conf = weapon_conf
         self.model       = YOLO(model_path)
@@ -50,25 +58,26 @@ class Detector:
         x1, y1, x2, y2 = bbox
         return max(x2 - x1, 1) / max(y2 - y1, 1)
 
-    def _could_be_gun(self, cname: str, conf: float,
-                      bbox, cls_idx: int) -> bool:
+    def _phone_not_gun(self, cname: str, conf: float,
+                       bbox, cls_idx: int) -> bool:
         """
-        Return True when a 'cell phone / remote' detection might actually be a gun.
-
-        A real handgun held horizontally is WIDER than it is tall (aspect ratio > 1.0).
-        A phone held upright is taller than wide (aspect ratio < 0.6).
+        Heuristic: return True when a detection is more likely a phone/remote
+        than a real weapon.
 
         Rules:
-          - COCO class is in the confusion set
-          - Confidence is LOW  (model is not sure)  -> more likely misclassified
-          - Aspect ratio is LANDSCAPE (>= 0.8)      -> gun shape, not portrait phone
+          1. Model said 'cell phone' / 'remote' with conf ≥ 0.55  → phone
+          2. COCO ID in confusion set AND conf < 0.70 AND shape is portrait
+             (aspect ratio < 0.55 → tall&thin like a phone held upright)
         """
-        if cls_idx not in CONFUSED_WITH_GUN:
-            return False
-        ar = self._aspect_ratio(bbox)
-        # Low confidence + landscape shape = suspicious
-        if conf < 0.65 and ar >= 0.8:
+        name_lc = cname.lower()
+
+        if name_lc in CONFUSED_NAMES and conf >= 0.55:
             return True
+
+        if cls_idx in CONFUSED_WITH_GUN and conf < 0.70:
+            if self._aspect_ratio(bbox) < 0.55:   # portrait = phone shape
+                return True
+
         return False
 
     def _parse_boxes(self, res, model_fallback=None):
@@ -107,17 +116,21 @@ class Detector:
 
         Steps:
           1. Run general COCO model
-          2. Apply gun-confusion upgrade: phone/remote detections that look like
-             a gun (low conf + landscape shape) are re-labelled '[?gun]' and
-             flagged is_weapon=True so they surface as alerts.
+          2. Apply phone/remote confusion filter on every box
           3. Run optional weapon model and merge results
           4. Return unified detection list
 
         Each dict: {class, conf, bbox:[x1,y1,x2,y2], is_weapon, is_person, source}
+        Ambiguous boxes (likely phone but uncertain) get class prefixed '[?phone/gun]'
+        and is_weapon=False so no alert fires, but the box is still drawn in yellow.
         """
         detections = []
 
-        # ── Step 1 & 2: general model + confusion upgrade ─────────────────
+        # ── Step 1 & 2: general model + confusion filter ──────────────────
+        # Ensure frame is uint8 numpy array — required by this YOLO version
+        if not isinstance(frame, np.ndarray):
+            return detections
+        frame = np.ascontiguousarray(frame, dtype=np.uint8)
         results = self.model(frame, conf=self.conf, verbose=False)
         if results:
             xyxy, confs, cls_idxs, names = self._parse_boxes(results[0], self.model)
@@ -130,10 +143,10 @@ class Detector:
 
                 is_weapon = self._is_weapon_name(cname)
 
-                # Upgrade ambiguous phone/remote → possible gun
-                if not is_weapon and self._could_be_gun(cname, conf, bbox, cls_idx):
-                    cname     = f"[?gun] {cname}"
-                    is_weapon = True   # fire the weapon alert
+                # Apply confusion filter only when model would call it a weapon
+                if is_weapon and self._phone_not_gun(cname, conf, bbox, cls_idx):
+                    cname     = f"[?phone/gun] {cname}"
+                    is_weapon = False
 
                 detections.append({
                     'class':     cname,
@@ -146,6 +159,7 @@ class Detector:
 
         # ── Step 3: dedicated weapon model (optional) ─────────────────────
         if self.weapon_model is not None:
+            frame = np.ascontiguousarray(frame, dtype=np.uint8)
             w_results = self.weapon_model(frame, conf=self.weapon_conf, verbose=False)
             if w_results:
                 xyxy, confs, cls_idxs, names = self._parse_boxes(w_results[0], self.weapon_model)
@@ -185,9 +199,6 @@ class Detector:
         """Frame-diff motion as % of changed pixels."""
         if prev_frame is None:
             return 0.0
-        # Resize prev_frame if source switched and resolution changed
-        if prev_frame.shape != frame.shape:
-            prev_frame = cv2.resize(prev_frame, (frame.shape[1], frame.shape[0]))
         gray1 = cv2.cvtColor(prev_frame, cv2.COLOR_BGR2GRAY)
         gray2 = cv2.cvtColor(frame,      cv2.COLOR_BGR2GRAY)
         diff  = cv2.absdiff(gray1, gray2)
